@@ -2,7 +2,7 @@ import { encode } from "@toon-format/toon";
 import type { RepoContext } from "../context.js";
 import { ghExec, ghExecWithStdin } from "../gh.js";
 import { AxiError } from "../errors.js";
-import { cleanBody } from "../body.js";
+import { cleanBody, warnTruncated } from "../body.js";
 import { readStdin, isStdinTTY } from "../stdin.js";
 
 export const API_HELP = `usage: gh-axi api [<method>] <path>
@@ -10,11 +10,12 @@ description: Make an authenticated GitHub API request. Defaults to GET if no met
 methods[6]:
   GET, POST, PUT, PATCH, DELETE, HEAD
 flags[9]:
-  -X <method> or -X=<method> (alias for the positional method; give once and do not combine with a positional method), --field <key=value> (repeatable; typed: numbers, true, false and null become JSON values), --raw-field <key=value> (repeatable; always sent as a string, e.g. content=+1), --header <key:value> (repeatable), --input <file> (raw JSON request body; use "-" for stdin), --paginate, --jq <expression>, --template <format>, --full (preserve complete field values and response bodies without truncation)
+  -X <method> or -X=<method> (alias for the positional method; give once and do not combine with a positional method), --field <key=value> (repeatable; typed: numbers, true, false and null become JSON values), -f/--raw-field <key=value> (repeatable; always sent as a string, e.g. content=+1), --header <key:value> (repeatable), --input <file> (raw JSON request body; use "-" for stdin), --paginate, --jq <expression>, --template <format>, --full (preserve complete field values and response bodies without truncation)
 examples:
   gh-axi api /repos/{owner}/{repo}
   gh-axi api POST /repos/{owner}/{repo}/issues --field title="Bug report"
   gh-axi api -X POST /repos/{owner}/{repo}/issues --field title="Bug report"
+  gh-axi api graphql -f query='query { viewer { login } }'
   gh-axi api /repos/{owner}/{repo}/pulls --paginate
   gh-axi api /repos/{owner}/{repo}/issues/1 --jq '[.labels[].name]'
   gh-axi api PUT /repos/{owner}/{repo}/branches/main/protection --input body.json
@@ -27,7 +28,12 @@ const HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]);
 const METHOD_FLAG = "-X";
 
 /** Value flags that may be given more than once, each occurrence forwarded to gh. */
-const REPEATABLE_VALUE_FLAGS = new Set(["--field", "--raw-field", "--header"]);
+const REPEATABLE_VALUE_FLAGS = new Set([
+  "--field",
+  "--raw-field",
+  "-f",
+  "--header",
+]);
 
 /** Value flags that gh accepts only one of, so a repeat is a caller mistake. */
 const SINGLE_VALUE_FLAGS = new Set(["--jq", "--template", "--input"]);
@@ -155,7 +161,7 @@ function parseArgs(args: string[]): ParsedApiArgs {
       parsed.method = upper;
     } else if (name === "--field") {
       parsed.fields.push(value);
-    } else if (name === "--raw-field") {
+    } else if (name === "--raw-field" || name === "-f") {
       parsed.rawFields.push(value);
     } else if (name === "--header") {
       parsed.headers.push(value);
@@ -229,9 +235,15 @@ export async function apiCommand(
   }
   if (methodGiven && positionals.length < 2) throw pathRequired;
 
-  const method =
-    methodFlag ?? (methodGiven ? positionals[0].toUpperCase() : "GET");
   const path = methodGiven ? positionals[1] : positionals[0];
+  // GraphQL is POST-only for queries. With GET, gh turns the fields into URL
+  // query parameters and GitHub answers `GET /graphql` with the schema
+  // introspection instead of running the query. Mirror `gh api`, which sends
+  // POST once fields are present; REST paths keep the explicit GET default.
+  const isGraphql = path.replace(/^\//, "") === "graphql";
+  const method =
+    methodFlag ??
+    (methodGiven ? positionals[0].toUpperCase() : isGraphql ? "POST" : "GET");
 
   const ghArgs = ["api", path, "--method", method];
 
@@ -273,16 +285,14 @@ export async function apiCommand(
   if (template !== undefined) ghArgs.push("--template", template);
 
   // A caller who wrote a jq expression or template already chose the exact shape
-  // they want, so noisy-field stripping would silently delete fields they asked
-  // for by name (`url`, `node_id`, ...). The length clamp still applies, so a
-  // selected field cannot blow the caller's context with an unbounded blob.
+  // they want, so neither noisy-field stripping nor length clamping may touch
+  // it: `api` is a full passthrough, and a clamped `--jq .body` that is then
+  // written back (read-modify-write) silently destroys the rest of the body.
   const callerShapedOutput = jq !== undefined || template !== undefined;
 
-  // --full is an explicit opt-in escape hatch: it keeps every field (like
-  // caller-shaped output) and additionally lifts the string-length clamp, so
-  // compact output stays the default everywhere --full is not given.
+  // --full keeps every field and lifts the length clamp for unshaped output.
   const stripNoisyKeys = !callerShapedOutput && !full;
-  const truncateValues = !full;
+  const truncateValues = !callerShapedOutput && !full;
 
   // Try to parse as JSON, strip noisy fields, encode to TOON; fall back to raw output
   const raw =
@@ -291,23 +301,22 @@ export async function apiCommand(
       : await ghExec(ghArgs, ctx);
   try {
     const data = JSON.parse(raw);
-    return encode(shapeOutput(data, stripNoisyKeys, truncateValues));
+    const shaped = shapeOutput(data, stripNoisyKeys, truncateValues);
+    if (truncateValues && JSON.stringify(shaped) !== JSON.stringify(data))
+      warnTruncated(
+        "api output was shortened or cleaned for display; use --full or --jq to get the complete values",
+      );
+    return encode(shaped);
   } catch {
     const trimmed = raw.trim();
     // A caller who shaped output with --jq/--template asked for the selected
     // value itself, and gh prints bare scalars, which are not valid JSON.
     // Print the value bare instead of wrapping it in the response-body
-    // envelope; the length clamp still applies.
-    if (callerShapedOutput) {
-      if (!full && trimmed.length > RAW_OUTPUT_TRUNCATION_LIMIT) {
-        return (
-          trimmed.slice(0, RAW_OUTPUT_TRUNCATION_LIMIT) + "... (truncated)"
-        );
-      }
-      return trimmed;
-    }
+    // envelope, and never clamp it: shaped output feeds write-backs, and a cut
+    // value read back into an edit deletes the rest (local fix c167d60).
+    if (callerShapedOutput) return trimmed;
     // Not JSON — wrap in TOON envelope with truncation metadata
-    const truncated = !full && trimmed.length > RAW_OUTPUT_TRUNCATION_LIMIT;
+    const truncated = truncateValues && trimmed.length > RAW_OUTPUT_TRUNCATION_LIMIT;
     const result: Record<string, unknown> = {
       api_response: {
         body: truncated
@@ -317,6 +326,9 @@ export async function apiCommand(
       },
     };
     if (truncated) {
+      warnTruncated(
+        `api output truncated to ${RAW_OUTPUT_TRUNCATION_LIMIT} of ${trimmed.length} chars; use --full or --jq to get the complete value`,
+      );
       (result.api_response as Record<string, unknown>).original_length =
         trimmed.length;
     }

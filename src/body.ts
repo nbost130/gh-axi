@@ -263,6 +263,26 @@ export function cleanBody(text: string): string {
   return s;
 }
 
+let truncationWarned = false;
+
+/** Test seam: re-arm the once-per-process truncation warning. */
+export function resetTruncationWarning(): void {
+  truncationWarned = false;
+}
+
+/**
+ * Tell the caller, on stderr, that a value was shortened or rewritten and how
+ * to get the original. stdout carries the (lossy) data, so this must not rely
+ * on the reader noticing an in-band marker: an agent once round-tripped a
+ * truncated issue body back through `gh api` and deleted the rest of it.
+ * Once per process, so a list of 30 issues is one line, not 30.
+ */
+export function warnTruncated(detail: string): void {
+  if (truncationWarned) return;
+  truncationWarned = true;
+  process.stderr.write(`gh-axi: warning: ${detail}\n`);
+}
+
 /**
  * Truncate a body field for display.
  * Cleanups are only applied when truncation is needed.
@@ -282,6 +302,9 @@ export function truncateBody(
   if (cleaned.length <= maxLen) {
     // Cleanup made it fit, but content was modified.
     if (cleaned !== body) {
+      warnTruncated(
+        `body was rewritten for display (${body.length} chars original); ${originalHint}`,
+      );
       return (
         cleaned +
         "\n(cleaned, " +
@@ -293,6 +316,9 @@ export function truncateBody(
     }
     return cleaned;
   }
+  warnTruncated(
+    `body truncated to ${maxLen} of ${cleaned.length} chars; ${fullHint}`,
+  );
   return (
     cleaned.slice(0, maxLen) +
     "\n... (truncated, " +

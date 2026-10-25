@@ -14,6 +14,7 @@ vi.mock("../../src/stdin.js", () => ({
 
 import { ghExec, ghExecWithStdin } from "../../src/gh.js";
 import { readStdin, isStdinTTY } from "../../src/stdin.js";
+import { resetTruncationWarning } from "../../src/body.js";
 import { apiCommand, API_HELP } from "../../src/commands/api.js";
 
 const mockedGhExec = vi.mocked(ghExec);
@@ -286,19 +287,18 @@ describe("apiCommand", () => {
     expect(result).toBe("autorelease: pending\nbug\ndocumentation");
   });
 
-  it("marks truncation when a bare --jq selection exceeds the raw output limit", async () => {
-    // Position-sensitive fixture: head and tail are distinct, so keeping the
-    // LAST 4000 characters instead of the first would fail these assertions.
+  it("never truncates a bare --jq selection past the raw output limit (local fix: shaped output feeds write-backs)", async () => {
+    // A clamped value read back into an edit deletes the rest, so the whole
+    // selection must come through, head and tail.
     const head = "HEAD-".repeat(20);
     const tail = "-TAIL".repeat(20);
-    mockedGhExec.mockResolvedValue(head + "x".repeat(4500) + tail + "\n");
+    const value = head + "x".repeat(4500) + tail;
+    mockedGhExec.mockResolvedValue(value + "\n");
 
     const result = await apiCommand(["/repos/octo/repo", "--jq", ".big"]);
 
-    expect(result).toHaveLength(4000 + "... (truncated)".length);
-    expect(result.endsWith("... (truncated)")).toBe(true);
-    expect(result.startsWith(head)).toBe(true);
-    expect(result).not.toContain("TAIL");
+    expect(result).toBe(value);
+    expect(result).not.toContain("(truncated)");
   });
 
   it("does not truncate or mark a bare --jq selection when --full is given", async () => {
@@ -437,7 +437,7 @@ describe("apiCommand", () => {
     expect(ghArgs).not.toContain("--jq");
   });
 
-  it("truncates long string values in caller-shaped --jq output", async () => {
+  it("passes long string values in caller-shaped --jq output through untruncated", async () => {
     const blob = "a".repeat(50_000);
     mockedGhExec.mockResolvedValue(JSON.stringify({ content: blob }));
 
@@ -447,8 +447,8 @@ describe("apiCommand", () => {
       "{content: .content}",
     ]);
 
-    expect(result).toContain("... (truncated)");
-    expect(result.length).toBeLessThan(3000);
+    expect(result).toContain(blob);
+    expect(result).not.toContain("(truncated)");
   });
 
   it("repeats --field and --header flags in order", async () => {
@@ -716,5 +716,134 @@ describe("apiCommand", () => {
       ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
       expect(mockedGhExec).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("apiCommand: caller-selected output is never truncated", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    resetTruncationWarning();
+    mockedIsStdinTTY.mockReturnValue(true);
+  });
+
+  it("returns a 10,000-char --jq .body in full with no truncated marker (raw jq output)", async () => {
+    const body = "b".repeat(10_000);
+    // `gh api --jq .body` prints the bare string, which is not JSON.
+    mockedGhExec.mockResolvedValue(body + "\n");
+
+    const out = await apiCommand([
+      "/repos/octo/repo/issues/1",
+      "--jq",
+      ".body",
+    ]);
+
+    expect(out).toContain(body);
+    expect(out).not.toContain("truncated: true");
+    expect(out).not.toContain("original_length");
+  });
+
+  it("returns a 10,000-char string in full when --jq output is valid JSON", async () => {
+    const body = "b".repeat(10_000);
+    mockedGhExec.mockResolvedValue(JSON.stringify(body));
+
+    const out = await apiCommand([
+      "/repos/octo/repo/issues/1",
+      "--jq",
+      ".body",
+    ]);
+
+    expect(out).toContain(body);
+    expect(out).not.toContain("truncated: true");
+    expect(out).not.toContain("original_length");
+  });
+
+  it("returns --template output in full", async () => {
+    const body = "t".repeat(10_000);
+    mockedGhExec.mockResolvedValue(body);
+
+    const out = await apiCommand([
+      "/repos/octo/repo/issues/1",
+      "--template",
+      "{{.body}}",
+    ]);
+
+    expect(out).toContain(body);
+    expect(out).not.toContain("truncated: true");
+    expect(out).not.toContain("original_length");
+  });
+
+  it("still truncates unshaped output and says so on stderr, naming --full", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockedGhExec.mockResolvedValue("r".repeat(10_000));
+
+    const out = await apiCommand(["/repos/octo/repo/issues/1"]);
+
+    expect(out).toContain("truncated: true");
+    const written = stderr.mock.calls.map((c) => String(c[0])).join("");
+    expect(written).toContain("--full");
+    stderr.mockRestore();
+  });
+});
+
+describe("apiCommand: graphql and field aliases", () => {
+  const QUERY =
+    'query { repository(owner:"octo", name:"repo") { issue(number:1) { title } } }';
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockedIsStdinTTY.mockReturnValue(true);
+    mockedGhExec.mockResolvedValue("{}");
+  });
+
+  function argv(): string[] {
+    return mockedGhExec.mock.calls[0][0];
+  }
+
+  it("passes --field query=... through to gh verbatim", async () => {
+    await apiCommand(["graphql", "--field", `query=${QUERY}`]);
+    const args = argv();
+    const i = args.indexOf("--field");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe(`query=${QUERY}`);
+  });
+
+  it("runs graphql as POST, not the default GET that makes GitHub return the schema", async () => {
+    await apiCommand(["graphql", "--field", `query=${QUERY}`]);
+    const args = argv();
+    expect(args[args.indexOf("--method") + 1]).toBe("POST");
+  });
+
+  it("lets an explicit method win on graphql", async () => {
+    await apiCommand(["graphql", "-X", "GET", "-f", `query=${QUERY}`]);
+    const args = argv();
+    expect(args[args.indexOf("--method") + 1]).toBe("GET");
+  });
+
+  it("keeps GET as the default for REST paths", async () => {
+    await apiCommand(["/repos/octo/repo"]);
+    const args = argv();
+    expect(args[args.indexOf("--method") + 1]).toBe("GET");
+  });
+
+  it("accepts -f and forwards it as a raw field with the query intact", async () => {
+    await apiCommand(["graphql", "-f", `query=${QUERY}`]);
+    const args = argv();
+    const i = args.indexOf("--raw-field");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe(`query=${QUERY}`);
+  });
+
+  it("accepts --raw-field and forwards it as a raw field", async () => {
+    await apiCommand(["graphql", "--raw-field", `query=${QUERY}`]);
+    const args = argv();
+    const i = args.indexOf("--raw-field");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe(`query=${QUERY}`);
+  });
+
+  it("accepts --raw-field=value form", async () => {
+    await apiCommand(["graphql", `--raw-field=query=${QUERY}`]);
+    const args = argv();
+    expect(args[args.indexOf("--raw-field") + 1]).toBe(`query=${QUERY}`);
   });
 });

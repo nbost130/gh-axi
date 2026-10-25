@@ -10,7 +10,12 @@ vi.mock("../src/stdin.js", () => ({
 }));
 
 import { isStdinTTY, readStdinSync } from "../src/stdin.js";
-import { cleanBody, takeBody, truncateBody } from "../src/body.js";
+import {
+  cleanBody,
+  resetTruncationWarning,
+  takeBody,
+  truncateBody,
+} from "../src/body.js";
 import { AxiError } from "../src/errors.js";
 
 const mockedIsStdinTTY = vi.mocked(isStdinTTY);
@@ -337,5 +342,37 @@ describe("truncateBody", () => {
     const result = truncateBody(body, 100);
     // Exact phrasing: "(cleaned, N chars original - use --full to see original)"
     expect(result).toMatch(/\(cleaned, \d+ chars original/);
+  });
+});
+
+describe("truncateBody stderr warning", () => {
+  beforeEach(() => {
+    resetTruncationWarning();
+  });
+
+  it("warns on stderr, naming --full, when it truncates", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    truncateBody("x".repeat(2000), 500);
+    const written = stderr.mock.calls.map((c) => String(c[0])).join("");
+    stderr.mockRestore();
+    expect(written).toContain("--full");
+    expect(written).toContain("truncated");
+  });
+
+  it("does not warn when the body fits", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    truncateBody("short", 500);
+    const calls = stderr.mock.calls.length;
+    stderr.mockRestore();
+    expect(calls).toBe(0);
+  });
+
+  it("warns once per process, not once per body", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    truncateBody("x".repeat(2000), 500);
+    truncateBody("y".repeat(2000), 500);
+    const calls = stderr.mock.calls.length;
+    stderr.mockRestore();
+    expect(calls).toBe(1);
   });
 });
